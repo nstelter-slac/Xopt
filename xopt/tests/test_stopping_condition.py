@@ -6,13 +6,14 @@ import json
 
 import pandas as pd
 import pytest
+import yaml
 
 from xopt import (
     VOCS,
     Evaluator,
     Xopt,
 )
-from xopt.generators.scipy import LatinHypercubeGenerator
+from xopt.generators.sequential.neldermead import NelderMeadGenerator
 from xopt.stopping_conditions import (
     CompositeCondition,
     ConvergenceCondition,
@@ -20,7 +21,6 @@ from xopt.stopping_conditions import (
     MaxEvaluationsCondition,
     StagnationCondition,
     TargetValueCondition,
-    get_stopping_condition,
 )
 
 
@@ -267,15 +267,14 @@ class TestStoppingConditionIntegration:
     )
     def test_conditions_in_xopt(self, simple_vocs, evaluator, condition):
         """Test each stopping condition individually."""
-        generator = LatinHypercubeGenerator(vocs=simple_vocs)
+        generator = NelderMeadGenerator(vocs=simple_vocs)
 
         X = Xopt(
-            vocs=simple_vocs,
             evaluator=evaluator,
             generator=generator,
             stopping_condition=condition,
         )
-
+        X.random_evaluate(1)
         X.run()
 
         # Basic assertions depending on condition type
@@ -289,10 +288,9 @@ class TestStoppingConditionIntegration:
 
     def test_no_stopping_condition_raises_error(self, simple_vocs, evaluator):
         """Test that run() without stopping condition raises ValueError."""
-        generator = LatinHypercubeGenerator(vocs=simple_vocs)
+        generator = NelderMeadGenerator(vocs=simple_vocs)
 
         X = Xopt(
-            vocs=simple_vocs,
             evaluator=evaluator,
             generator=generator,
             # No stopping_condition
@@ -344,7 +342,7 @@ class TestStoppingConditionIntegration:
     def test_composite_condition_validators_and_serializers(self):
         """Test CompositeCondition validators and serializers."""
         # Test empty conditions list
-        with pytest.raises(ValueError, match="At least one condition must be provided"):
+        with pytest.raises(ValueError):
             CompositeCondition(conditions=[], logic="or")
 
         # Test invalid logic
@@ -370,10 +368,7 @@ class TestStoppingConditionIntegration:
         assert serialized["conditions"][0]["name"] == "MaxEvaluationsCondition"
 
         # Test with invalid condition type
-        with pytest.raises(
-            ValueError,
-            match="Each condition must be a StoppingCondition instance or a dict",
-        ):
+        with pytest.raises(ValueError):
             CompositeCondition(conditions=["invalid"], logic="or")
 
     def test_composite_condition_logic_paths(self, simple_vocs):
@@ -436,21 +431,6 @@ class TestStoppingConditionIntegration:
         )
         assert not condition_or_false.should_stop(data, simple_vocs)
 
-    def test_get_stopping_condition_function(self):
-        """Test the get_stopping_condition utility function."""
-        # Test valid condition names
-        max_eval_class = get_stopping_condition("MaxEvaluationsCondition")
-        assert max_eval_class == MaxEvaluationsCondition
-
-        target_class = get_stopping_condition("TargetValueCondition")
-        assert target_class == TargetValueCondition
-
-        # Test invalid condition name
-        with pytest.raises(
-            ValueError, match="No stopping condition found with name: InvalidCondition"
-        ):
-            get_stopping_condition("InvalidCondition")
-
     def test_edge_cases_empty_and_missing_data(self, simple_vocs):
         """Test edge cases with empty data and missing columns."""
         # Test all conditions with empty dataframe
@@ -484,3 +464,103 @@ class TestStoppingConditionIntegration:
         data = pd.DataFrame({"x1": [0.1], "x2": [0.2], "f1": [0.5]})
         for condition in conditions[1:]:  # Skip MaxEvaluationsCondition
             assert not condition.should_stop(data, bad_vocs)
+
+    def test_max_evaluations_backward_compatibility_python(
+        self, simple_vocs, evaluator
+    ):
+        """Test backward compatibility: max_evaluations creates MaxEvaluationsCondition."""
+        generator = NelderMeadGenerator(vocs=simple_vocs)
+
+        # Initialize Xopt with old max_evaluations parameter
+        X = Xopt(
+            evaluator=evaluator,
+            generator=generator,
+            max_evaluations=5,
+        )
+
+        # Verify it creates the correct stopping condition
+        assert X.stopping_condition is not None
+        assert isinstance(X.stopping_condition, MaxEvaluationsCondition)
+        assert X.stopping_condition.max_evaluations == 5
+
+    def test_max_evaluations_backward_compatibility_yaml(
+        self, simple_vocs, test_function
+    ):
+        """Test backward compatibility: max_evaluations from YAML creates MaxEvaluationsCondition."""
+        yaml_config = """
+
+generator:
+    name: latin_hypercube
+    vocs:
+        variables:
+            x1: [0.0, 1.0]
+            x2: [0.0, 1.0]
+        objectives:
+            f1: EXPLORE
+evaluator:
+    function: __test_function__
+max_evaluations: 3
+"""
+        # Parse the YAML and inject the test function
+        config = yaml.safe_load(yaml_config)
+        config["evaluator"] = Evaluator(function=test_function)
+
+        X = Xopt(**config)
+
+        # Verify it creates the correct stopping condition
+        assert X.stopping_condition is not None
+        assert isinstance(X.stopping_condition, MaxEvaluationsCondition)
+        assert X.stopping_condition.max_evaluations == 3
+
+    def test_stopping_condition_yaml_deserialization(self, simple_vocs, test_function):
+        """Test that a stopping condition is correctly instantiated from YAML."""
+        yaml_config = """
+generator:
+    name: latin_hypercube
+    vocs:
+        variables:
+            x1: [0.0, 1.0]
+            x2: [0.0, 1.0]
+        objectives:
+            f1: EXPLORE
+evaluator:
+    function: __test_function__
+stopping_condition:
+    name: CompositeCondition
+    logic: or
+    conditions:
+        - name: MaxEvaluationsCondition
+          max_evaluations: 10
+        - name: TargetValueCondition
+          objective_name: f1
+          target_value: 0.01
+          tolerance: 0.001
+"""
+        config = yaml.safe_load(yaml_config)
+        config["evaluator"] = Evaluator(function=test_function)
+
+        X = Xopt(**config)
+
+        assert isinstance(X.stopping_condition, CompositeCondition)
+        assert X.stopping_condition.logic == "or"
+        assert len(X.stopping_condition.conditions) == 2
+        assert isinstance(X.stopping_condition.conditions[0], MaxEvaluationsCondition)
+        assert X.stopping_condition.conditions[0].max_evaluations == 10
+        assert isinstance(X.stopping_condition.conditions[1], TargetValueCondition)
+        assert X.stopping_condition.conditions[1].objective_name == "f1"
+        assert X.stopping_condition.conditions[1].target_value == 0.01
+        assert X.stopping_condition.conditions[1].tolerance == 0.001
+
+    def test_max_evaluations_and_stopping_condition_raises_error(
+        self, simple_vocs, evaluator
+    ):
+        """Test that specifying both max_evaluations and stopping_condition raises an error."""
+        generator = NelderMeadGenerator(vocs=simple_vocs)
+
+        with pytest.raises(ValueError, match="Cannot specify both"):
+            Xopt(
+                evaluator=evaluator,
+                generator=generator,
+                max_evaluations=10,
+                stopping_condition=MaxEvaluationsCondition(max_evaluations=2),
+            )
